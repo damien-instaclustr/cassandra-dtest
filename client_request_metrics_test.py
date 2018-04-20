@@ -1,29 +1,58 @@
-from dtest import Tester, create_ks, create_cf
+import time
+
+from dtest import Tester, create_ks
 from tools.jmxutils import JolokiaAgent, remove_perf_disable_shared_mem, make_mbean
 
+from cassandra.cqlengine import connection, columns
+from cassandra.cqlengine.models import Model
+from cassandra.cqlengine.query import BatchQuery
 
-class ClientRequestMetricContainer():
+# Some pre-computed murmur 3 hashes; there are no good python murmur3
+# hashing libraries :(
+murmur3_hashes = {
+    5: -7509452495886106294,
+    10: -6715243485458697746,
+    16: -5477287129830487822,
+    13: -5034495173465742853,
+    11: -4156302194539278891,
+    1: -4069959284402364209,
+    19: -3974532302236993209,
+    8: -3799847372828181882,
+    2: -3248873570005575792,
+    4: -2729420104000364805,
+    18: -2695747960476065067,
+    15: -1191135763843456182,
+    20: 1388667306199997068,
+    7: 1634052884888577606,
+    6: 2705480034054113608,
+    9: 3728482343045213994,
+    14: 4279681877540623768,
+    17: 5467144456125416399,
+    12: 8582886034424406875,
+    3: 9010454139840013625
+}
+
+expected_local_requests = 8
+expected_remote_requests = 12
+
+class ClientRequestMetricsContainer():
 
     def __init__(self, node, scope):
         self.node = node
-        self.scope = scope
 
         self.local_requests_mbean = make_mbean(
             'metrics',
             type='ClientRequest',
-            scope=self.scope,
+            scope=scope,
             name='LocalRequests'
         )
 
         self.remote_requests_mbean = make_mbean(
             'metrics',
             type='ClientRequest',
-            scope=self.scope,
+            scope=scope,
             name='RemoteRequests'
         )
-
-        self.current_local_requests = self.getLocalRequests()
-        self.current_remote_requests= self.getRemoteRequests()
 
     def getLocalRequests(self):
         with JolokiaAgent(self.node) as jmx:
@@ -33,108 +62,155 @@ class ClientRequestMetricContainer():
         with JolokiaAgent(self.node) as jmx:
             return jmx.read_attribute(self.remote_requests_mbean, 'Count')
 
-    def compareLocalRequests(self):
-        return self.getLocalRequests() - self.current_local_requests
 
-    def compareRemoteRequests(self):
-        return self.getRemoteRequests() - self.current_remote_requests
+class ClientRequestMetricsSnapshot():
+
+    def __init__(self, client_request_metrics):
+        self.local_requests = client_request_metrics.getLocalRequests()
+        self.remote_requests = client_request_metrics.getRemoteRequests()
 
 
-class TokenDistributor():
-    """
-    Assumes static tokens with num_tokens == 1
-    """
+def setupSchema(session):
+    create_ks(session, 'ks', 1)
+    result = session.execute("""
+                             CREATE TABLE test (
+                                 id int,
+                                 ord int,
+                                 val varchar,
+                                 PRIMARY KEY (id, ord)
+                             );""")
 
-    def __init__(self, nodes_list):
-        self.nodes = nodes_list
+def setup(obj):
+    cluster = obj.cluster
+    cluster.populate(2)
 
-    def get_node_from_token(self, token):
-        first = None
-        current = None
-        for node in self.nodes:
-            diff = node.initial_token - token
-            if diff > 0:
-                if current is None:
-                    current = node
-                else:
-                    current_diff = current.inital_token - token
-                    current = node if diff < current_diff else current
+    node = cluster.nodelist()[0]
+    remove_perf_disable_shared_mem(node)
 
-            if first is None:
-                first = node
-            else:
-                first = node if node.initial_token < first.initial_token else first
+    cluster.start(wait_for_binary_proto=True)
+    session = obj.patient_exclusive_cql_connection(node)
+    setupSchema(session)
 
-        if current is None:
-            return first
-        else:
-            return current
+    return (session, node)
+
 
 class TestLocalRemoteRequests(Tester):
 
-    def test_read_and_write(self):
-        cluster  = self.cluster
-        cluster.populate(2)
-        test_node = cluster.nodelist()[0]
-        remove_perf_disable_shared_mem(test_node)
-        cluster.start(wait_for_binary_proto=True)
-        session = self.patient_exclusive_cql_connection(test_node)
+    def test_write_and_read(self):
+        session, node = setup(self)
 
-        create_ks(session, 'ks', 1)
-        session.execute("""
-                        CREATE TABLE test (
-                            id int,
-                            ord int,
-                            val varchar,
-                            PRIMARY KEY (id, ord)
-                        );""")
+        read_metrics = ClientRequestMetricsContainer(node, 'Read')
+        write_metrics = ClientRequestMetricsContainer(node, 'Write')
 
-        token_dist = TokenDistributor(cluster.nodelist())
+        # Get initial results:
+        r1_r = ClientRequestMetricsSnapshot(read_metrics)
+        r1_w = ClientRequestMetricsSnapshot(write_metrics)
 
-        # Get initial values:
-        read_metrics = ClientRequestMetricContainer(test_node, 'Read')
-        write_metrics = ClientRequestMetricContainer(test_node, 'Write')
-
-        # Run test:
-        num_read_writes = 1000
-        for i in range(0, num_read_writes):
-            session.execute("""
-                            INSERT INTO ks.test (id, ord, val)
-                            VALUES ({}, 1, 'aaaa');
-                            """.format(i))
-            session.execute("""
-                            SELECT id, ord, val
-                            FROM ks.test
-                            WHERE id={};
-                            """.format(i))
+        # Run Write test:
+        for i in murmur3_hashes.keys():
+            session.execute(
+                "INSERT INTO ks.test (id, ord, val) VALUES ({}, 1, 'aaaa');".format(i)
+            )
 
         # Collect results:
-        metric_results = {
-            'local_reads': read_metrics.compareLocalRequests(),
-            'remote_reads': read_metrics.compareRemoteRequests(),
-            'local_writes': write_metrics.compareLocalRequests(),
-            'remote_writes':  write_metrics.compareRemoteRequests()
-        }
+        r2_r = ClientRequestMetricsSnapshot(read_metrics)
+        r2_w = ClientRequestMetricsSnapshot(write_metrics)
 
-        # Get expected results:
-        local_count = 0
-        remote_count = 0
+        # Run Read test:
+        for i in murmur3_hashes.keys():
+            session.execute(
+                "SELECT (id, ord, val) FROM ks.test WHERE id={};".format(i)
+            )
 
-        for i in range(0, num_read_writes):
-            result = session.execute("""
-                                     SELECT token(id) from ks.test
-                                     WHERE id={};
-                                     """.format(i))
-            for r in result:
-                node = token_dist.get_node_from_token(r.system_token_id)
-                if node == test_node:
-                    local_count = local_count + 1
-                else:
-                    remote_count = remote_count + 1
+        # Collect results:
+        r3_r = ClientRequestMetricsSnapshot(read_metrics)
+        r3_w = ClientRequestMetricsSnapshot(write_metrics)
 
-        # Compared expected against the collected results:
-        assert local_count == metric_results['local_writes']
-        assert remote_count == metric_results['remote_writes']
-        assert local_count == metric_results['local_reads']
-        assert remote_count == metric_results['remote_reads']
+        # Note: There are requests to system_auth.roles table which adds
+        #   noise to the Read.LocalRequests mbean.
+        #   Therefore, it is assumed that Read.LocalRequests >= the expected value
+        assert expected_local_requests == (r2_w.local_requests - r1_w.local_requests)
+        assert expected_remote_requests == (r2_w.remote_requests - r1_w.remote_requests)
+        assert 0 <= (r2_r.local_requests - r1_r.local_requests)
+        assert 0 == (r2_r.remote_requests - r1_r.remote_requests)
+
+        assert 0 == (r3_w.local_requests - r2_w.local_requests)
+        assert 0 == (r3_w.remote_requests - r2_w.remote_requests)
+        assert expected_local_requests <= (r3_r.local_requests - r2_r.local_requests)
+        assert expected_remote_requests == (r3_r.remote_requests - r2_r.remote_requests)
+
+    def test_batch_and_slice(self):
+        session, node = setup(self)
+
+        read_metrics = ClientRequestMetricsContainer(node, 'Read')
+        write_metrics = ClientRequestMetricsContainer(node, 'Write')
+
+        # Get initial results:
+        r1_r = ClientRequestMetricsSnapshot(read_metrics)
+        r1_w = ClientRequestMetricsSnapshot(write_metrics)
+
+        # Run batch test:
+        query = 'BEGIN BATCH '
+        for i in murmur3_hashes.keys():
+            for y in range(0, 100):
+                query += "INSERT INTO ks.test (id, ord, val) VALUES ({}, {}, 'aaa')".format(i, y)
+        query += 'APPLY BATCH;'
+        session.execute(query)
+
+        # Collect results:
+        r2_r = ClientRequestMetricsSnapshot(read_metrics)
+        r2_w = ClientRequestMetricsSnapshot(write_metrics)
+
+        # Run read range test:
+        for i in murmur3_hashes.keys():
+            session.execute("""
+                            SELECT (id, ord, val) FROM ks.test
+                            WHERE id={}
+                            AND ord > 0
+                            AND ord < 100;
+                            """.format(i))
+        # Collect results:
+        r3_r = ClientRequestMetricsSnapshot(read_metrics)
+        r3_w = ClientRequestMetricsSnapshot(write_metrics)
+
+        # Note: There are requests to system_auth.roles table which adds
+        #   noise to the Read.LocalRequests mbean.
+        #   Therefore, it is assumed that Read.LocalRequests >= the expected value
+        assert expected_local_requests == (r2_w.local_requests - r1_w.local_requests)
+        assert expected_remote_requests == (r2_w.remote_requests - r1_w.remote_requests)
+        assert 0 <= (r2_r.local_requests - r1_r.local_requests)
+        assert 0 == (r2_r.remote_requests - r1_r.remote_requests)
+
+        assert 0 == (r3_w.local_requests - r2_w.local_requests)
+        assert 0 == (r3_w.remote_requests - r2_w.remote_requests)
+        assert expected_local_requests <= (r3_r.local_requests - r2_r.local_requests)
+        assert expected_remote_requests == (r3_r.remote_requests - r2_r.remote_requests)
+
+    def test_paxos(self):
+        session, node = setup(self)
+
+        read_metrics = ClientRequestMetricsContainer(node, 'Read')
+        write_metrics = ClientRequestMetricsContainer(node, 'Write')
+
+        # Get initial results:
+        r1_r = ClientRequestMetricsSnapshot(read_metrics)
+        r1_w = ClientRequestMetricsSnapshot(write_metrics)
+
+        # Run write test:
+        for i in murmur3_hashes.keys():
+            session.execute(
+                "UPDATE ks.test SET val='aaa' WHERE id={} AND ord=0".format(i)
+            )
+
+        # Collect results:
+        r2_r = ClientRequestMetricsSnapshot(read_metrics)
+        r2_w = ClientRequestMetricsSnapshot(write_metrics)
+
+        # Note: There are requests to system_auth.roles table which adds
+        #   noise to the Read.LocalRequests mbean.
+        #   Therefore, it is assumed that Read.LocalRequests >= the expected value
+        assert expected_local_requests == (r2_w.local_requests - r1_w.local_requests)
+        assert expected_remote_requests == (r2_w.remote_requests - r1_w.remote_requests)
+        assert 0 <= (r2_r.local_requests - r1_r.local_requests)
+        assert 0 == (r2_r.remote_requests - r1_r.remote_requests)
 
