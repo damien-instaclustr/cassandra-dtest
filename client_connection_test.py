@@ -1,6 +1,10 @@
 from dtest import Tester, create_ks
 from tools.jmxutils import JolokiaAgent, remove_perf_disable_shared_mem, make_mbean
 from time import sleep
+from cassandra.policies import ConstantReconnectionPolicy
+import pytest
+
+since = pytest.mark.since
 
 def setup(obj):
     cluster = obj.cluster
@@ -10,7 +14,10 @@ def setup(obj):
     remove_perf_disable_shared_mem(node)
 
     cluster.start(wait_for_binary_proto=True)
-    session = obj.patient_cql_connection(node)
+    session = obj.patient_cql_connection(
+        node,
+        retry_policy=ConstantReconnectionPolicy(0, max_attempts=None)
+    )
     setupSchema(session)
 
     return (session, node)
@@ -50,8 +57,11 @@ def permit_host(host, node):
 
 class TestClientConnection(Tester):
 
+    @since('4.0')
     def test_client_connection(self):
         """
+        @jira_ticket CASSANDRA-10789
+
         Test:
             1 - JMX 'banHostname' method adds a hostname to the blacklist and
             any existing connections to the hostname are closed.
@@ -59,7 +69,7 @@ class TestClientConnection(Tester):
             and that client driver connections can reconnect to the cluster
             once removed.
         """
-        
+
         session, node = setup(self)
         host = session.cluster.metadata.get_host(node.ip_addr)
         assert host.is_up
@@ -77,7 +87,8 @@ class TestClientConnection(Tester):
 
         banned_hosts = permit_host('127.0.0.1', node)
 
-        # Wait for client driver's reconnection policy to reconnect with the cluster:
+        # Wait for client driver's reconnection policy to reconnect with the
+        # node:
         sleep(1)
 
         assert host.is_up
