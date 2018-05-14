@@ -16,14 +16,13 @@ def _log_error_handler(errordata):
     with lock:
         error_data = errordata
 
-KEYSPACE_NAME = 'testks'
+KEYSPACE_NAME = 'test_allocate_token_ks'
 
 @since('3.0')
 class TestAllocateTokensForKeyspace(Tester):
     """
-    TODO
-    @jira_ticket CASSANDRA-XXX
-    @since 3.0
+    Test cases where a valid and invalid keyspace name is given to allocate_tokens_for_keyspace
+    @jira_ticket CASSANDRA-12757
     """
     def test_valid_keyspace(self):
         cluster = self.cluster
@@ -39,10 +38,6 @@ class TestAllocateTokensForKeyspace(Tester):
             wait_for_binary_proto=True,
             jvm_args=["-Dcassandra.allocate_tokens_for_keyspace={}".format(KEYSPACE_NAME)]
         )
-
-    #@pytest.fixture(autouse=True)
-    #def fixture_add_additional_log_patterns(self, fixture_dtest_setup):
-    #    fixture_dtest_setup.allow_log_errors = True
 
     def test_invalid_keyspace(self):
 
